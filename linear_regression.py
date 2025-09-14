@@ -1,75 +1,69 @@
 # linear_regression.py
-# Simple contextual linear-regression baseline with train/val/test split.
-# - Collects on TRAIN with epsilon-greedy (random when no model yet)
-# - Fits ridge regression to predict immediate reward
-# - Evaluates greedily on TRAIN/VAL/TEST each epoch
-#
-# Outputs:
-#   - linreg_epoch_log.csv  (epoch-level metrics for train/val/test)
-#   - linreg_theta.csv      (final learned coefficients)
+# Simple contextual linear-regression baseline (geen splits).
+# Output:
+#   - linreg_epoch_log.csv        (epoch, avg_loss, avg_revenue, avg_peak_kWh)
+#   - linreg_theta.csv            (geleerde coëfficiënten)
 
 import math
-from pathlib import Path
 from collections import defaultdict
+from decimal import Decimal
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
-# ====================== CONFIG ======================
-# If you have split CSVs from build_sessions_split.py they'll be used.
-SESSIONS_TRAIN = "sessions_train.csv"
-SESSIONS_VAL   = "sessions_validation.csv"
-SESSIONS_TEST  = "sessions_test.csv"
+# =========== CONFIG =========== (matcht qlearn_dynamic_pricing.py)
+SESSIONS_CSV = "sessions_2024.csv"
+PRICES_CSV   = "dayahead_nl_2024_filled.csv"
+TZ_LOCAL     = "Europe/Amsterdam"
 
-# Fallback (if the split files don't exist, this single file will be used for all sets)
-SESSIONS_CSV_FALLBACK = "sessions_2024.csv"
-
-PRICES_CSV = "dayahead_nl_2024_filled.csv"
-TZ_LOCAL   = "Europe/Amsterdam"
-
-# Date window used to build a complete price index (keeps env stable)
 START_DATE = "2024-01-01"
 END_DATE   = "2024-12-31"
 
+ACTION_MIN_EUR  = Decimal("0.10")
+ACTION_MAX_EUR  = Decimal("1.00")
+ACTION_STEP_EUR = Decimal("0.01")
+
 DT_MIN = 15
-DT_H   = DT_MIN / 60.0
+DT_H   = DT_MIN/60.0
+
 SITE_PMAX_KW = 11.0 * 1
 
-# Objective / demand
+# Economie / doelen
 ALPHA = 2.0
-RETAIL_ACTIONS = [round(x, 2) for x in np.arange(0.10, 1.00 + 0.001, 0.05)]  # €0.10..€1.00
-REF_PRICE   = 0.35
-ELASTICITY  = 1.5
-URG_ETA     = 0.25
+RETAIL_ACTIONS = [float(ACTION_MIN_EUR + i*ACTION_STEP_EUR)
+                  for i in range(int((ACTION_MAX_EUR - ACTION_MIN_EUR)/ACTION_STEP_EUR) + 1)]
 
-# Training schedule
-EPOCHS = 30
-EPSILON_EXPLORE = 0.30
-EPSILON_DECAY   = 0.98
-RNG_SEED = 42
+REF_PRICE  = 0.35
+ELASTICITY = 1.5
+URG_ETA    = 0.25
 
-# Regression
-RIDGE_L2 = 1e-4
-MAX_SAMPLES = 500_000
-# ====================================================
+# Training
+EPOCHS          = 100
+EPSILON_EXPLORE = 0.30   # begin-exploration voor dataverzameling
+EPSILON_DECAY   = 0.98   # per epoch
+RIDGE_L2        = 1e-4   # lichte L2 stabilisatie
+MAX_SAMPLES     = 500_000
+RNG_SEED        = 42
+# ==============================
 
 rng = np.random.default_rng(RNG_SEED)
-PRICE_QS = None  # used in env._state()
+PRICE_QS = None  # lazy gevuld in env._state()
 
-# ---------- Common IO ----------
-def load_sessions(path: str) -> pd.DataFrame:
+
+# ---------- Helpers ----------
+def load_sessions(path=SESSIONS_CSV):
     s = pd.read_csv(path)
-    for c in ("arrival", "departure", "energy_kWh"):
+    for c in ("arrival","departure","energy_kWh"):
         if c not in s.columns:
-            raise ValueError(f"{path} mist kolom '{c}'")
+            raise ValueError(f"sessions.csv mist kolom '{c}'")
 
     arr_utc = pd.to_datetime(s["arrival"].astype(str).str.strip(), errors="coerce", utc=True)
     dep_utc = pd.to_datetime(s["departure"].astype(str).str.strip(), errors="coerce", utc=True)
 
-    # If parsing failed a lot, try as local then convert to UTC
     if arr_utc.isna().mean() > 0.5 or dep_utc.isna().mean() > 0.5:
-        arr_local = pd.to_datetime(s["arrival"].astype(str).str.strip(), errors="coerce")
-        dep_local = pd.to_datetime(s["departure"].astype(str).str.strip(), errors="coerce")
+        arr_local = pd.to_datetime(s["arrival"].astype(str).str.strip(), errors="coerce", utc=False)
+        dep_local = pd.to_datetime(s["departure"].astype(str).str.strip(), errors="coerce", utc=False)
         if getattr(arr_local.dt, "tz", None) is None:
             arr_local = arr_local.dt.tz_localize(TZ_LOCAL)
         else:
@@ -92,16 +86,18 @@ def load_sessions(path: str) -> pd.DataFrame:
         s["pmax_kW"] = 11.0
 
     s["energy_kWh"] = pd.to_numeric(s["energy_kWh"], errors="coerce")
-    s = s.dropna(subset=["arrival_utc", "departure_utc", "energy_kWh"])
+    s = s.dropna(subset=["arrival_utc","departure_utc","energy_kWh"])
     s = s[s["energy_kWh"] > 1e-6].copy()
     if "cp_id" not in s.columns:
         s["cp_id"] = "cp0"
-    return s[["cp_id", "arrival_utc", "departure_utc", "energy_kWh", "pmax_kW"]].reset_index(drop=True)
 
-def load_prices(path=PRICES_CSV) -> pd.Series:
+    return s[["cp_id","arrival_utc","departure_utc","energy_kWh","pmax_kW"]].reset_index(drop=True)
+
+
+def load_prices(path=PRICES_CSV):
     df = pd.read_csv(path)
 
-    # --- timestamps → UTC index ---
+    # tijd → UTC index
     if "timestamp_europe_amsterdam" in df.columns:
         s = df["timestamp_europe_amsterdam"].astype(str).str.strip()
         ts_utc = pd.to_datetime(s, errors="coerce", utc=True)
@@ -118,9 +114,9 @@ def load_prices(path=PRICES_CSV) -> pd.Series:
     elif "timestamp_utc" in df.columns:
         ts_utc = pd.to_datetime(df["timestamp_utc"].astype(str).str.strip(), errors="coerce", utc=True)
     else:
-        raise ValueError("Kon geen tijdkolom in prijzen CSV vinden.")
+        raise ValueError("Kon geen tijdkolom vinden (timestamp_europe_amsterdam / timestamp_local / timestamp_utc).")
 
-    # --- price to EUR/kWh ---
+    # prijs → EUR/kWh
     def to_num(x):
         return pd.to_numeric(x.astype(str).str.replace(",", ".", regex=False).str.strip(), errors="coerce")
 
@@ -143,36 +139,37 @@ def load_prices(path=PRICES_CSV) -> pd.Series:
         if k > nn:
             best, nn = ser, k
     if best is None or nn == 0:
-        raise ValueError("Geen bruikbare prijzen gevonden in prijzen CSV.")
+        raise ValueError("Geen bruikbare prijzen gevonden.")
 
     prices = (pd.DataFrame({"eur_per_kwh": best.values}, index=ts_utc)
               .dropna(subset=["eur_per_kwh"])
               .sort_index())
     prices = prices.groupby(level=0)["eur_per_kwh"].mean().to_frame()
-
     pr15 = prices["eur_per_kwh"].resample("15min").ffill()
 
     start_utc = pd.Timestamp(START_DATE, tz=TZ_LOCAL).tz_convert("UTC") - pd.Timedelta(hours=1)
     end_utc   = pd.Timestamp(END_DATE,   tz=TZ_LOCAL).tz_convert("UTC")
     full_idx  = pd.date_range(start_utc, end_utc, freq="15min", tz="UTC")
-    pr15      = pr15.reindex(full_idx).ffill().bfill()
+    pr15 = pr15.reindex(full_idx).ffill().bfill()
 
     if pr15.dropna().empty:
         raise ValueError("Prijsreeks blijft leeg na vullen.")
     return pr15
 
+
 def daterange_local_days(start_date, end_date):
     start = pd.Timestamp(start_date, tz=TZ_LOCAL)
-    end   = pd.Timestamp(end_date, tz=TZ_LOCAL)
+    end   = pd.Timestamp(end_date,   tz=TZ_LOCAL)
     cur = start
     while cur < end:
         yield cur
         cur += pd.Timedelta(days=1)
 
-# ---------- Demand model ----------
+
+# ---------- Demand ----------
 def willingness(price):
     x = (REF_PRICE - price) * ELASTICITY
-    return 1.0 / (1.0 + np.exp(-x))
+    return 1.0/(1.0 + np.exp(-x))
 
 def desired_power_kW(price, pmax, hours_left, energy_left_kWh):
     w = willingness(price)
@@ -184,11 +181,12 @@ def desired_power_kW(price, pmax, hours_left, energy_left_kWh):
     want = max(base, req, urg_floor if energy_left_kWh > 0 else 0.0)
     return float(min(pmax, want))
 
+
 # ---------- Environment ----------
 class PricingEnv:
     def __init__(self, sessions_df, price_series_utc, site_pmax=SITE_PMAX_KW):
         self.sessions = sessions_df.copy()
-        self.pr = price_series_utc.copy()  # UTC indexed Series
+        self.pr = price_series_utc.copy()
         self.site_pmax = site_pmax
 
     def _price_at(self, t_utc):
@@ -231,7 +229,6 @@ class PricingEnv:
         powers = np.zeros(len(self.jobs), dtype=float)
 
         wholesale = self._price_at(self.t_utc)
-
         for idx in np.where(mask)[0]:
             row = self.jobs.loc[idx]
             hours_left = max((row["departure_utc"] - self.t_utc).total_seconds()/3600.0, DT_H)
@@ -260,15 +257,12 @@ class PricingEnv:
         return self._state(), reward, self.done, {"revenue": revenue, "peak_kWh": peak_kWh}
 
     def _state(self):
-        # slot in local quarter-hour steps
-        tl = self.t_utc.tz_convert(TZ_LOCAL)
-        slot = int(((tl - tl.normalize()).total_seconds() // (DT_MIN * 60)) % int(24 * 60 / DT_MIN))
-
+        global PRICE_QS
+        slot = int(((self.t_utc.tz_convert(TZ_LOCAL) - self.t_utc.tz_convert(TZ_LOCAL).normalize()).total_seconds() // (DT_MIN*60)) % (int(24*60/DT_MIN)))
         mask = (self.jobs["arrival_utc"] <= self.t_utc) & (self.jobs["departure_utc"] > self.t_utc) & (self.jobs["energy_left_kWh"] > 1e-9)
         n_act = int(mask.sum()); n_act_bin = min(n_act, 3)
 
         w = self._price_at(self.t_utc)
-        global PRICE_QS
         if PRICE_QS is None:
             qs = np.quantile(self.pr.dropna().values, [0.25, 0.5, 0.75])
             PRICE_QS = tuple(qs)
@@ -283,6 +277,7 @@ class PricingEnv:
 
         return (slot, n_act_bin, wbin, urg_bin)
 
+
 # ---------- Features ----------
 FEATURE_NAMES = [
     "bias",
@@ -291,7 +286,7 @@ FEATURE_NAMES = [
     "peak16_20",
     "n_act_bin", "urg_bin",
     "sin_t", "cos_t",
-    "price*peak", "price*wholesale"
+    "price*peak", "price*wholesale",
 ]
 
 def build_features(env: PricingEnv, state, price: float) -> np.ndarray:
@@ -303,178 +298,136 @@ def build_features(env: PricingEnv, state, price: float) -> np.ndarray:
 
     x = np.array([
         1.0,
-        price, price * price,
+        price, price*price,
         wholesale,
         peak,
         float(n_act_bin), float(urg_bin),
-        math.sin(2 * math.pi * hour / 24.0), math.cos(2 * math.pi * hour / 24.0),
-        price * peak, price * wholesale
+        math.sin(2*math.pi*hour/24.0), math.cos(2*math.pi*hour/24.0),
+        price*peak, price*wholesale
     ], dtype=float)
     return x
 
-# ---------- Linear Reward Model ----------
+
+# ---------- Linear model ----------
 class LinearRewardModel:
     def __init__(self, n_features, l2=RIDGE_L2):
         self.theta = np.zeros(n_features, dtype=float)
         self.l2 = l2
+        self._fitted = False
 
     def fit(self, X: np.ndarray, y: np.ndarray):
         XtX = X.T @ X
         n = XtX.shape[0]
-        XtX = XtX + self.l2 * np.eye(n)
+        XtX += self.l2 * np.eye(n)
         Xty = X.T @ y
         self.theta = np.linalg.solve(XtX, Xty)
+        self._fitted = True
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return X @ self.theta
 
-# ---------- Dataset collection / evaluation ----------
-def collect_dataset(env: PricingEnv, epsilon: float, buffer_X: np.ndarray, buffer_y: np.ndarray, model: LinearRewardModel | None):
-    """
-    Walk all days; collect (X,y) on TRAIN env.
-    If model is None -> random actions.
-    Else -> epsilon-greedy on predicted immediate reward.
-    """
-    steps = 0
-    n_feat = len(FEATURE_NAMES)
-    if buffer_X.size == 0:
-        buffer_X = np.zeros((0, n_feat), dtype=float)
 
-    for day_local in daterange_local_days(START_DATE, END_DATE):
-        s = env.reset(day_local)
-        done = False
-        while not done:
-            if (model is None) or (rng.random() < epsilon):
-                price = float(rng.choice(RETAIL_ACTIONS))
-            else:
-                best_p, best_pred = None, -1e18
-                for p in RETAIL_ACTIONS:
-                    x_tmp = build_features(env, s, p).reshape(1, -1)
-                    pred = float(model.predict(x_tmp)[0])
-                    if pred > best_pred:
-                        best_pred, best_p = pred, p
-                price = best_p
-
-            x = build_features(env, s, price)
-            s2, reward, done, _info = env.step(price)
-
-            buffer_X = np.vstack([buffer_X, x])
-            buffer_y = np.concatenate([buffer_y, np.array([reward], dtype=float)])
-            steps += 1
-
-            # cap
-            if buffer_X.shape[0] > MAX_SAMPLES:
-                keep = MAX_SAMPLES // 2
-                buffer_X = buffer_X[-keep:, :]
-                buffer_y = buffer_y[-keep:]
-
-            s = s2
-
-    return buffer_X, buffer_y, steps
-
-def eval_env(env: PricingEnv, model: LinearRewardModel):
-    sum_loss = sum_rev = sum_peak = 0.0
-    n_days = 0
-    for day_local in daterange_local_days(START_DATE, END_DATE):
-        s = env.reset(day_local)
-        done = False
-        day_rev = 0.0
-        day_peak = 0.0
-        while not done:
-            best_p, best_pred = None, -1e18
-            for p in RETAIL_ACTIONS:
-                x = build_features(env, s, p).reshape(1, -1)
-                pred = float(model.predict(x)[0])
-                if pred > best_pred:
-                    best_pred, best_p = pred, p
-            s2, reward, done, info = env.step(best_p)
-            s = s2
-            day_rev  += info.get("revenue", 0.0)
-            day_peak += info.get("peak_kWh", 0.0)
-        day_loss = -day_rev + ALPHA * day_peak
-        sum_loss += day_loss
-        sum_rev  += day_rev
-        sum_peak += day_peak
-        n_days   += 1
-
-    if n_days == 0:
-        return float("nan"), float("nan"), float("nan")
-    return sum_loss / n_days, sum_rev / n_days, sum_peak / n_days
-
-# ---------- Training ----------
+# ---------- Training loop ----------
 def train():
-    # Load prices once
-    prices = load_prices(PRICES_CSV)
+    sessions = load_sessions(SESSIONS_CSV)
+    prices   = load_prices(PRICES_CSV)
 
-    # Load session splits (or fallback)
-    have_split = Path(SESSIONS_TRAIN).exists() and Path(SESSIONS_VAL).exists() and Path(SESSIONS_TEST).exists()
-    if have_split:
-        print("✅ Splits gevonden: sessions_train.csv, sessions_validation.csv, sessions_test.csv")
-        s_train = load_sessions(SESSIONS_TRAIN)
-        s_val   = load_sessions(SESSIONS_VAL)
-        s_test  = load_sessions(SESSIONS_TEST)
-    else:
-        print("⚠️  Splits niet gevonden. Gebruik fallback:", SESSIONS_CSV_FALLBACK, "voor train/val/test allemaal.")
-        s_all = load_sessions(SESSIONS_CSV_FALLBACK)
-        s_train = s_all.copy()
-        s_val   = s_all.copy()
-        s_test  = s_all.copy()
-
-    # Build environments
-    env_train = PricingEnv(s_train, prices, site_pmax=SITE_PMAX_KW)
-    env_val   = PricingEnv(s_val,   prices, site_pmax=SITE_PMAX_KW)
-    env_test  = PricingEnv(s_test,  prices, site_pmax=SITE_PMAX_KW)
-
+    env = PricingEnv(sessions, prices, site_pmax=SITE_PMAX_KW)
     n_feat = len(FEATURE_NAMES)
     model = LinearRewardModel(n_features=n_feat, l2=RIDGE_L2)
 
-    # Replay buffer
+    # replay buffer
     X_buf = np.empty((0, n_feat), dtype=float)
     y_buf = np.empty((0,), dtype=float)
 
-    # For epsilon-greedy collection
+    epoch_rows = []  # (epoch, avg_loss, avg_revenue, avg_peak_kWh)
     epsilon = EPSILON_EXPLORE
-    current_model: LinearRewardModel | None = None
 
-    rows = []  # epoch log
+    for epoch in range(1, EPOCHS+1):
+        print(f"\n=== EPOCH {epoch}/{EPOCHS} ===")
 
-    for epoch in range(1, EPOCHS + 1):
-        # --- Collect on TRAIN (epsilon-greedy; random while model is None) ---
-        X_buf, y_buf, steps = collect_dataset(env_train, epsilon, X_buf, y_buf, model=current_model)
+        # === 1) Dataverzameling met ε-exploration (on-policy) ===
+        for day_local in daterange_local_days(START_DATE, END_DATE):
+            s = env.reset(day_local)
+            done = False
+            while not done:
+                if (not model._fitted) or rng.random() < epsilon:
+                    price = float(rng.choice(RETAIL_ACTIONS))
+                else:
+                    # greedy w.r.t. predicted immediate reward
+                    best_p, best_pred = None, -1e18
+                    for p in RETAIL_ACTIONS:
+                        x = build_features(env, s, p).reshape(1, -1)
+                        pred = float(model.predict(x)[0])
+                        if pred > best_pred:
+                            best_pred, best_p = pred, p
+                    price = best_p
 
-        # --- Fit on TRAIN buffer ---
+                x = build_features(env, s, price)
+                s2, reward, done, info = env.step(price)
+
+                # store transition (X,y) op reward
+                X_buf = np.vstack([X_buf, x])
+                y_buf = np.concatenate([y_buf, np.array([reward], dtype=float)])
+
+                # cap buffer
+                if X_buf.shape[0] > MAX_SAMPLES:
+                    keep = MAX_SAMPLES // 2
+                    X_buf = X_buf[-keep:, :]
+                    y_buf = y_buf[-keep:]
+
+                s = s2
+
+        # === 2) Fit model op verzamelde data ===
         model.fit(X_buf, y_buf)
 
-        # --- Eval (greedy) ---
-        tr_loss, tr_rev, tr_peak = eval_env(env_train, model)
-        va_loss, va_rev, va_peak = eval_env(env_val,   model)
-        te_loss, te_rev, te_peak = eval_env(env_test,  model)
+        # (optioneel) dump coefs één keer op het einde
+        if epoch == EPOCHS:
+            coef_df = pd.DataFrame({"feature": FEATURE_NAMES, "theta": model.theta})
+            coef_df.to_csv("linreg_theta.csv", index=False)
 
-        rows.append({
-            "epoch": epoch,
-            "avg_loss_train": tr_loss, "avg_revenue_train": tr_rev, "avg_peak_kWh_train": tr_peak,
-            "avg_loss_val":   va_loss, "avg_revenue_val":   va_rev, "avg_peak_kWh_val":   va_peak,
-            "avg_loss_test":  te_loss, "avg_revenue_test":  te_rev, "avg_peak_kWh_test":  te_peak,
-            "buffer_steps":   int(len(y_buf)),
-            "epsilon":        float(epsilon),
-        })
+        # === 3) Greedy evaluatie over het hele jaar ===
+        sum_loss = sum_rev = sum_peak = 0.0
+        n_days = 0
+        for day_local in daterange_local_days(START_DATE, END_DATE):
+            s = env.reset(day_local)
+            done = False
+            day_rev = 0.0
+            day_peak = 0.0
+            while not done:
+                # kies beste prijs volgens model (myopic)
+                best_p, best_pred = None, -1e18
+                for p in RETAIL_ACTIONS:
+                    x = build_features(env, s, p).reshape(1, -1)
+                    pred = float(model.predict(x)[0])
+                    if pred > best_pred:
+                        best_pred, best_p = pred, p
+                s2, reward, done, info = env.step(best_p)
+                s = s2
+                day_rev  += info.get("revenue", 0.0)
+                day_peak += info.get("peak_kWh", 0.0)
 
-        print(f"== EPOCH {epoch}/{EPOCHS} == "
-              f"train: loss={tr_loss:.4f} rev={tr_rev:.2f} peak={tr_peak:.2f} | "
-              f"val: loss={va_loss:.4f} rev={va_rev:.2f} peak={va_peak:.2f} | "
-              f"test: loss={te_loss:.4f} rev={te_rev:.2f} peak={te_peak:.2f} | "
-              f"data={len(y_buf)} steps eps={epsilon:.3f}")
+            day_loss = -day_rev + ALPHA * day_peak
+            sum_loss += day_loss
+            sum_rev  += day_rev
+            sum_peak += day_peak
+            n_days   += 1
 
-        # decay epsilon and update current_model
-        epsilon = max(0.05, epsilon * EPSILON_DECAY)
-        current_model = model
+        avg_loss = sum_loss / n_days if n_days else float("nan")
+        avg_rev  = sum_rev  / n_days if n_days else float("nan")
+        avg_peak = sum_peak / n_days if n_days else float("nan")
+        epoch_rows.append((epoch, avg_loss, avg_rev, avg_peak))
 
-    # Save logs
-    df = pd.DataFrame(rows)
-    df.to_csv("linreg_epoch_log.csv", index=False)
-    coef_df = pd.DataFrame({"feature": FEATURE_NAMES, "theta": model.theta})
-    coef_df.to_csv("linreg_theta.csv", index=False)
-    print("Saved: linreg_epoch_log.csv, linreg_theta.csv")
+        print(f"== EPOCH {epoch}/{EPOCHS} ==  avg_loss={avg_loss:.4f}  avg_rev={avg_rev:.2f}  avg_peak_kWh={avg_peak:.2f}  | data={len(y_buf)} steps")
+
+        # exploration langzaam afbouwen
+        epsilon *= EPSILON_DECAY
+        epsilon = max(0.05, epsilon)
+
+    # Log
+    df_ep = pd.DataFrame(epoch_rows, columns=["epoch","avg_loss","avg_revenue","avg_peak_kWh"])
+    df_ep.to_csv("linreg_epoch_log.csv", index=False)
+    print("💾 linreg_epoch_log.csv geschreven")
 
 if __name__ == "__main__":
     train()
